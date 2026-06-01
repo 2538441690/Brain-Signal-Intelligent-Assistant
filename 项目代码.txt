@@ -1,0 +1,1600 @@
+我的代码目录为：
+P6.Agent项目案例
+  agent文件夹
+    tools文件夹
+        agent_tools.py
+        mcp_client.py
+        middleware.py
+        tool_registry.py
+    react_agent.py
+  config文件夹
+    agent.yml
+    chroma.yml
+    prompts.yml
+    rag.yml
+    tools.yml
+  data文件夹
+  model文件夹
+    factory.py
+  prompts文件夹
+    main_prompts.txt
+    rag_summarize.txt
+    report_prompt.txt
+  rag文件夹
+    rag_service.py
+    vector_store.py
+  utils文件夹
+    config_handler.py
+    conversation_db.py
+    file_handler.py
+    logger_handler.py
+    path_tool.py
+    prompt_loader.py
+app.py
+.env
+
+下面是我的具体代码：
+agent_tools.py:
+#工具封装、注册、调用与中间件日志/异常处理
+'''
+关键实现：
+
+agent_tools.py 中使用 @tool 装饰器定义工具（如 rag_summarize、fetch_external_data 等）。
+'''
+
+# 动态提示词切换（Function Calling + 多轮对话上下文管理）
+'''
+关键实现：
+
+agent_tools.py 中定义工具 fill_context_for_report，调用后通过 monitor_tool 设置 runtime.context["report"] = True。
+'''
+import httpx
+import os
+from utils.logger_handler import logger
+from langchain_core.tools import tool
+
+from rag.rag_service import RagSummarizeService
+import random
+from utils.config_handler import agent_conf
+from utils.path_tool import get_abs_path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+AMAP_KEY = os.getenv("AMAP_WEBSERVICE_KEY")
+if not AMAP_KEY:
+    logger.warning("未设置高德地图 API Key，地图工具将不可用")
+
+rag = RagSummarizeService()
+
+user_ids = ["1001", "1002", "1003", "1004", "1005", "1006", "1007", "1008", "1009", "1010",]
+month_arr = ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06",
+             "2025-07", "2025-08", "2025-09", "2025-10", "2025-11", "2025-12", ]
+
+external_data = {}
+
+@tool(description="搜索高德地图上的兴趣点（POI），例如餐厅、酒店、景点等。参数：keyword（搜索关键词，必填），city（城市名，可选）。返回地点列表。")
+def amap_poi_search(keyword: str, city: str = "") -> str:
+    """高德地图 POI 搜索"""
+    if not AMAP_KEY:
+        return "高德地图服务未配置 API Key，无法使用。"
+    url = "https://restapi.amap.com/v5/place/text"
+    params = {
+        "key": AMAP_KEY,
+        "keywords": keyword,
+        "region": city,
+        "city_limit": True,
+        "page": 1,
+        "offset": 10
+    }
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "1":
+                pois = data.get("pois", [])
+                if not pois:
+                    return f"未找到与 '{keyword}' 相关的地点。"
+                results = []
+                for i, poi in enumerate(pois[:10], 1):
+                    name = poi.get("name", "未知")
+                    address = poi.get("address", "无地址")
+                    results.append(f"{i}. {name}\n   地址: {address}")
+                return "\n\n".join(results)
+            else:
+                return f"搜索失败: {data.get('info', '未知错误')}"
+    except Exception as e:
+        logger.error(f"高德 POI 搜索异常: {e}")
+        return f"搜索出错: {e}"
+
+@tool(description="规划步行路线。参数：origin（起点，格式'经度,纬度'），destination（终点，格式'经度,纬度'）。返回路线距离和预估时间。")
+def amap_walking_route(origin: str, destination: str) -> str:
+    """高德步行路线规划"""
+    if not AMAP_KEY:
+        return "高德地图服务未配置 API Key。"
+    url = "https://restapi.amap.com/v3/direction/walking"
+    params = {
+        "key": AMAP_KEY,
+        "origin": origin,
+        "destination": destination
+    }
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "1":
+                path = data.get("route", {}).get("paths", [])[0]
+                distance = float(path.get("distance", 0)) / 1000
+                duration = int(path.get("duration", 0)) // 60
+                return f"步行路线规划成功：距离约 {distance:.2f} 公里，预计用时 {duration} 分钟。"
+            else:
+                return f"规划失败: {data.get('info', '未知错误')}"
+    except Exception as e:
+        logger.error(f"高德步行路线规划异常: {e}")
+        return f"规划出错: {e}"
+
+@tool(description="规划驾车路线。参数：origin, destination，可选 waypoints（途经点，多个用;分隔）。返回距离、时间、过路费等信息。")
+def amap_driving_route(origin: str, destination: str, waypoints: str = "") -> str:
+    if not AMAP_KEY:
+        return "高德地图服务未配置 API Key。"
+    url = "https://restapi.amap.com/v3/direction/driving"
+    params = {
+        "key": AMAP_KEY,
+        "origin": origin,
+        "destination": destination,
+        "strategy": 10,
+        "extensions": "base"
+    }
+    if waypoints:
+        params["waypoints"] = waypoints
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "1":
+                path = data.get("route", {}).get("paths", [])[0]
+                distance = float(path.get("distance", 0)) / 1000
+                duration = int(path.get("duration", 0)) // 60
+                tolls = path.get("tolls", 0)
+                return f"驾车路线：距离 {distance:.2f} 公里，预计 {duration} 分钟，过路费 {tolls} 元。"
+            else:
+                return f"规划失败: {data.get('info', '未知错误')}"
+    except Exception as e:
+        return f"出错: {e}"
+
+#RAG向量总结服务
+@tool(description="从向量存储中检索参考资料")
+def rag_summarize(query: str) -> str:
+    return rag.rag_summarize(query)
+
+# #天气工具
+# @tool(description="获取指定城市的天气，以消息字符串的形式返回")
+# def get_weather(city: str) -> str:
+#     return f"城市{city}天气为晴天，气温26摄氏度，空气湿度50%，南风1级，AQI21，最近6小时降雨概率极低"
+
+# #用户定位
+# @tool(description="获取用户所在城市的名称，以纯字符串形式返回")
+# def get_user_location() -> str:
+#     return random.choice(["深圳", "合肥", "杭州"])
+
+
+@tool(description="获取被试的ID，以纯字符串形式返回")
+def get_subject_id() -> str:
+    return random.choice(user_ids)
+
+
+@tool(description="获取当前月份，以纯字符串形式返回")
+def get_current_month() -> str:
+    return random.choice(month_arr)
+
+@tool(description="获取指定被试、指定实验范式的脑电信号解码准确率，返回百分比")
+def get_decoding_accuracy(subject_id: str, paradigm: str) -> str:
+    # 从数据库或API查询真实准确率
+    return f"被试{subject_id}在{paradigm}任务中解码准确率为87.5%"
+
+@tool(description="获取当前脑电采集设备的信号质量指标（阻抗、采样率、工频干扰等）")
+def get_signal_quality() -> str:
+    return "信号质量良好：平均阻抗5kΩ，采样率1000Hz，工频干扰抑制成功"
+
+@tool(description="查询脑信号解码模型中可用的特征提取算法列表")
+def list_available_features() -> str:
+    return "CSP, FBCSP, Riemannian Geometry, Deep ConvNet, EEGNet"
+
+@tool(description="运行在线脑信号解码（模拟或真实），返回解码类别及置信度")
+def run_realtime_decoding() -> str:
+    # 调用后端解码服务
+    return "解码结果：想象右手运动，置信度0.92"
+
+
+def generate_external_data():
+    """
+    {
+        "user_id": {
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            ...
+        },
+        "user_id": {
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            ...
+        },
+        "user_id": {
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            "month" : {"特征": xxx, "效率": xxx, ...}
+            ...
+        },
+        ...
+    }
+    :return:
+    """
+    if not external_data:
+        external_data_path = get_abs_path(agent_conf["external_data_path"])
+
+        if not os.path.exists(external_data_path):
+            raise FileNotFoundError(f"外部数据文件{external_data_path}不存在")
+        #取csv文件
+        with open(external_data_path, "r", encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                arr: list[str] = line.strip().split(",")
+
+                user_id: str = arr[0].replace('"', "")
+                feature: str = arr[1].replace('"', "")
+                efficiency: str = arr[2].replace('"', "")
+                consumables: str = arr[3].replace('"', "")
+                comparison: str = arr[4].replace('"', "")
+                time: str = arr[5].replace('"', "")
+
+                if user_id not in external_data:
+                    external_data[user_id] = {}
+
+                external_data[user_id][time] = {
+                    "特征": feature,
+                    "效率": efficiency,
+                    "耗材": consumables,
+                    "对比": comparison,
+                }
+
+#从外部数据csv文件中抽取
+@tool(description="从外部系统中获取指定用户在指定月份的使用记录，以纯字符串形式返回， 如果未检索到返回空字符串")
+def fetch_external_data(user_id: str, month: str) -> str:
+    generate_external_data()
+
+    try:
+        return external_data[user_id][month]
+    except KeyError:
+        logger.warning(f"[fetch_external_data]未能检索到用户：{user_id}在{month}的使用记录数据")
+        return ""
+
+
+# if __name__ =='__main__':
+#    print(fetch_external_data("1001","2025-01"))
+
+@tool(description="无入参，无返回值，调用后触发中间件自动为报告生成的场景动态注入上下文信息，为后续提示词切换提供上下文信息")
+def fill_context_for_report():
+    return "fill_context_for_report已调用"
+
+
+mcp_client.py:
+import asyncio
+import concurrent.futures
+from typing import List, Dict, Any
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from langchain_core.tools import BaseTool, StructuredTool
+from utils.logger_handler import logger
+
+
+class MCPClient:
+    """管理一个 MCP 服务，自动发现并创建工具"""
+    def __init__(self, server_url: str):
+        self.server_url = server_url
+
+    async def _list_tools(self) -> List[Dict[str, Any]]:
+        async with streamablehttp_client(self.server_url) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                tools = []
+                for tool in result.tools:
+                    logger.info(f"[MCP] 发现工具: {tool.name}, 描述: {tool.description}")
+                    tools.append({
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.inputSchema
+                    })
+                return tools
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, self._list_tools())
+            return future.result()
+
+    def to_langchain_tools(self) -> List[BaseTool]:
+        tool_defs = self.list_tools()
+        langchain_tools = []
+        for tool_def in tool_defs:
+            tool = MCPToolInstance(
+                name=tool_def["name"],
+                description=tool_def["description"],
+                server_url=self.server_url,
+                input_schema=tool_def.get("input_schema")
+            )
+            langchain_tools.append(tool.to_langchain_tool())
+        return langchain_tools
+
+
+class MCPToolInstance:
+    """单个 MCP 工具的封装"""
+    def __init__(self, name: str, description: str, server_url: str, input_schema: dict = None):
+        self.name = name
+        self.description = description
+        self.server_url = server_url
+        self.input_schema = input_schema
+
+    async def _arun(self, **kwargs) -> str:
+        try:
+            async with streamablehttp_client(self.server_url) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.call_tool(self.name, arguments=kwargs)
+                    if result.content and len(result.content) > 0:
+                        # 直接返回原始文本，不做任何额外解析
+                        return result.content[0].text
+                    return str(result)
+        except Exception as e:
+            logger.error(f"MCP工具 '{self.name}' 调用失败: {e}")
+            return f"工具 '{self.name}' 调用失败: {e}"
+
+    def _run(self, **kwargs) -> str:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, self._arun(**kwargs))
+            return future.result()
+
+    def to_langchain_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self._run,
+            coroutine=self._arun,
+            name=self.name,
+            description=self.description,
+            args_schema=self.input_schema
+        )
+
+middleware.py:
+#工具封装、注册、调用与中间件日志/异常处理
+'''
+关键实现：
+
+middleware.py 中：
+
+@wrap_tool_call 装饰的 monitor_tool 拦截每次工具调用，记录日志（logger.info）并捕获异常（try...except）。
+
+@before_model 装饰的 log_before_model 在模型调用前输出状态日志。
+
+中间件列表 [monitor_tool, log_before_model, report_prompt_switch] 传入Agent。
+'''
+
+#动态提示词切换（Function Calling + 多轮对话上下文管理）
+'''
+关键实现：
+
+middleware.py 中定义 @dynamic_prompt 装饰的 report_prompt_switch 函数：
+
+从 request.runtime.context 中获取 report 标志。
+
+若为 True 则返回报告生成提示词（load_report_prompts()），否则返回系统提示词（load_system_prompts()）。
+'''
+
+from typing import Callable
+from utils.prompt_loader import load_system_prompts, load_report_prompts
+from langchain.agents import AgentState
+from langchain.agents.middleware import wrap_tool_call, before_model, dynamic_prompt, ModelRequest
+from langchain.tools.tool_node import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
+from langgraph.types import Command
+from utils.logger_handler import logger
+
+
+@wrap_tool_call
+def monitor_tool(
+        # 请求的数据封装
+        request: ToolCallRequest,
+        # 执行的函数本身
+        handler: Callable[[ToolCallRequest], ToolMessage | Command],
+) -> ToolMessage | Command:             # 工具执行的监控
+    logger.info(f"[tool monitor]执行工具：{request.tool_call['name']}")
+    logger.info(f"[tool monitor]传入参数：{request.tool_call['args']}")
+
+    try:
+        result = handler(request)
+        logger.info(f"[tool monitor]工具{request.tool_call['name']}调用成功")
+
+        if request.tool_call['name'] == "fill_context_for_report":
+            request.runtime.context["report"] = True
+
+        return result
+    except Exception as e:
+        logger.error(f"工具{request.tool_call['name']}调用失败，原因：{str(e)}")
+        raise e
+
+
+@before_model
+def log_before_model(
+        state: AgentState,          # 整个Agent智能体中的状态记录
+        runtime: Runtime,           # 记录了整个执行过程中的上下文信息
+):         # 在模型执行前输出日志
+    logger.info(f"[log_before_model]即将调用模型，带有{len(state['messages'])}条消息。")
+
+    logger.debug(f"[log_before_model]{type(state['messages'][-1]).__name__} | {state['messages'][-1].content.strip()}")
+
+    return None
+
+
+@dynamic_prompt                 # 每一次在生成提示词之前，调用此函数
+def report_prompt_switch(request: ModelRequest):     # 动态切换提示词
+    is_report = request.runtime.context.get("report", False)
+    if is_report:               # 是报告生成场景，返回报告生成提示词内容
+        return load_report_prompts()
+
+    return load_system_prompts()
+
+tool_registry.py:
+"""
+工具注册中心 - 整合本地工具和外部 MCP 工具
+"""
+
+from typing import List
+from langchain_core.tools import BaseTool
+from utils.logger_handler import logger
+import yaml
+from utils.path_tool import get_abs_path
+
+from agent.tools.agent_tools import (
+    rag_summarize, get_decoding_accuracy, get_signal_quality,
+    list_available_features, run_realtime_decoding, get_subject_id,
+    get_current_month, fetch_external_data, fill_context_for_report,
+    amap_poi_search, amap_walking_route, amap_driving_route
+)
+
+
+class ToolRegistry:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._local_tools: List[BaseTool] = []
+        self._external_tools: List[BaseTool] = []
+        self._load_local_tools()
+        self._load_external_tools()
+
+    def _load_local_tools(self):
+        self._local_tools = [
+            rag_summarize, get_decoding_accuracy, get_signal_quality,
+            list_available_features, run_realtime_decoding, get_subject_id,
+            get_current_month, fetch_external_data, fill_context_for_report,
+            amap_poi_search, amap_walking_route, amap_driving_route
+        ]
+        logger.info(f"[ToolRegistry] 加载了 {len(self._local_tools)} 个本地工具")
+
+    def _load_external_tools(self):
+        try:
+            config_path = get_abs_path("config/tools.yml")
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            logger.info("[ToolRegistry] 未找到 config/tools.yml，跳过外部工具加载")
+            return
+        except Exception as e:
+            logger.error(f"[ToolRegistry] 加载外部工具配置失败: {e}")
+            return
+
+        external_tools = config.get("external_tools", [])
+        for tool_def in external_tools:
+            if tool_def.get("type") == "mcp":
+                self._register_mcp_service(tool_def)
+
+    def _register_mcp_service(self, tool_def: dict):
+        """注册MCP服务：自动发现所有工具并添加"""
+        from agent.tools.mcp_client import MCPClient
+        endpoint = tool_def.get("endpoint")
+        service_name = tool_def.get("name", endpoint)  # 取 name 字段，没有则用 endpoint
+        if not endpoint:
+            logger.error(f"MCP服务 {service_name} 缺少 endpoint")
+            return
+        logger.info(f"[ToolRegistry] 正在注册 MCP 服务: {service_name}")
+        try:
+            client = MCPClient(endpoint)
+            tools = client.to_langchain_tools()
+            for tool in tools:
+                self._external_tools.append(tool)
+                logger.info(f"[ToolRegistry] 注册 MCP 工具: {tool.name} (来自服务 {service_name})")
+        except Exception as e:
+            logger.error(f"[ToolRegistry] 注册 MCP 服务 {service_name} 失败: {e}", exc_info=True)
+
+    def get_all_tools(self) -> List[BaseTool]:
+        return self._local_tools + self._external_tools
+
+
+tool_registry = ToolRegistry()
+
+
+react_agent.py:
+#基于LangChain构建ReAct推理循环
+'''
+关键实现：
+
+使用 from langchain.agents import create_agent 创建ReAct架构的Agent。
+
+ReactAgent.__init__ 中调用 create_agent，传入模型、系统提示词、工具列表和中间件。
+
+execute_stream 方法调用 self.agent.stream 实现流式推理，支持多步骤问答中的工具选择与执行顺序自主决策。
+
+通过 stream_mode="values" 和 context 参数实现状态传递。
+'''
+
+#工具封装、注册、调用与中间件日志/异常处理
+'''
+关键实现：
+
+react_agent.py 中将所有工具通过 tools 参数注册到 create_agent。
+'''
+
+#动态提示词切换（Function Calling + 多轮对话上下文管理）
+'''
+关键实现：
+
+react_agent.py 的 execute_stream 中初始化 context={"report": False}，实现场景自适应的提示词切换。
+'''
+
+from langchain.agents import create_agent
+from model.factory import chat_model
+from utils.prompt_loader import load_system_prompts
+from agent.tools.agent_tools import (
+    rag_summarize, get_decoding_accuracy, get_signal_quality,
+    list_available_features, run_realtime_decoding, get_subject_id,
+    get_current_month, fetch_external_data, fill_context_for_report
+)
+from agent.tools.middleware import monitor_tool, log_before_model, report_prompt_switch
+from utils.conversation_db import get_messages, add_message
+from utils.logger_handler import logger
+from agent.tools.tool_registry import tool_registry
+
+
+class ReactAgent:
+    def __init__(self):
+        # 从注册中心获取所有工具
+        all_tools = tool_registry.get_all_tools()
+        logger.info(f"[ReactAgent] 加载了 {len(all_tools)} 个工具: {[t.name for t in all_tools]}")
+        self.agent = create_agent(
+            model=chat_model,
+            system_prompt=load_system_prompts(),
+            tools=all_tools,   # 动态获取
+            middleware=[monitor_tool, log_before_model, report_prompt_switch],
+        )
+
+        # 不再使用内存 self.memory，所有会话历史从数据库读取
+
+    def execute_stream(self, query: str, conv_id: str, user_id: int):
+        """
+        执行流式推理，需要传入 user_id 以关联消息到特定用户
+        """
+        # 1. 从数据库加载历史消息（需要传入 user_id）
+        history_messages = get_messages(conv_id, user_id)
+
+        # 2. 构建 LangChain 消息列表
+        messages = []
+        for msg in history_messages:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": query})
+
+        # 3. 添加用户消息到数据库（传入 user_id）
+        add_message(conv_id, user_id, "user", query)
+
+        input_dict = {"messages": messages}
+        response_content = ""
+
+        try:
+            for chunk in self.agent.stream(input_dict, stream_mode="values", context={"report": False}):
+                latest_message = chunk["messages"][-1]
+                if latest_message.content:
+                    content_piece = latest_message.content.strip()
+                    response_content += content_piece
+                    yield content_piece + "\n"
+        except Exception as e:
+            logger.error(f"Agent 执行出错: {e}")
+            yield f"出错: {str(e)}"
+            return
+
+        # 5. 将助手回复保存到数据库（传入 user_id）
+        if response_content:
+            add_message(conv_id, user_id, "assistant", response_content)
+
+if __name__ == '__main__':
+    agent = ReactAgent()
+
+    for chunk in agent.execute_stream("给我生成我的使用报告"):
+        print(chunk, end="", flush=True)
+
+
+agent.yml:
+external_data_path: data/external/records.csv
+
+chroma.yml:
+collection_name : agent
+persist_directory : chroma_db
+k :  3
+data_path : data
+md5_hex_store : md5.text
+allow_knowledge_file_type : ["txt","pdf"]
+
+chunk_size : 200
+chunk_overlap : 20
+separators : ["\n\n","。",".","?","？","!"," ",""]
+
+prompts.yml:
+main_prompt_path : prompts/main_prompt.txt
+rag_summarize_prompt_path : prompts/rag_summarize.txt
+report_prompt_path : prompts/report_prompt.txt
+
+
+rag.yml:
+chat_model_name: qwen3-max
+embedding_model_name: text-embedding-v4
+
+tools.yml:
+external_tools:
+  - name: "计算器服务"
+    endpoint: "https://mcp.api-inference.modelscope.net/fe9ae1a3001a4f/mcp"
+    type: "mcp"
+  - name: "时间服务"
+    endpoint: "https://mcp.api-inference.modelscope.net/6cd4a33895fc4d/mcp"
+    type: "mcp"
+  - name: "天气服务"  
+    endpoint: "https://mcp.api-inference.modelscope.net/3eef1f267a4c4c/mcp"
+    type: "mcp"
+
+factory.py:
+from abc import ABC, abstractmethod
+from typing import Optional
+from langchain_core.embeddings import Embeddings
+from langchain_community.chat_models.tongyi import BaseChatModel
+from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_community.chat_models.tongyi import ChatTongyi
+from utils.config_handler import rag_conf
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+
+#工厂类/抽象类
+class BaseModelFactory(ABC):
+    @abstractmethod
+    def generator(self) -> Optional[Embeddings | BaseChatModel]:
+        pass
+
+#配置具体使用的chat_model
+class ChatModelFactory(BaseModelFactory):
+    def generator(self)->Optional[Embeddings | BaseChatModel]:
+        return ChatTongyi(model=rag_conf["chat_model_name"])
+
+#配置具体使用的embedding_model
+class EmbeddingsFactory(BaseModelFactory):
+    def generator(self) -> Optional[Embeddings | BaseChatModel]:
+        return DashScopeEmbeddings(model=rag_conf["embedding_model_name"])
+
+
+chat_model = ChatModelFactory().generator()
+
+embed_model = EmbeddingsFactory().generator()
+
+
+
+rag_service.py:
+
+
+"""
+总结服务类：用户提问，搜索参考资料，将提问和参考资料提交给模型(vector_store实现)，让模型总结回复
+"""
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+
+from rag.vector_store import VectorStoreService
+from utils.prompt_loader import load_rag_prompts
+from langchain_core.prompts import PromptTemplate
+from model.factory import chat_model
+
+
+def print_prompt(prompt):
+    print("="*20)
+    print(prompt.to_string())
+    print("="*20)
+    return prompt
+
+
+class RagSummarizeService(object):
+    def __init__(self):
+        self.vector_store = VectorStoreService()
+        self.retriever = self.vector_store.get_retriever()
+        self.prompt_text = load_rag_prompts()
+        self.prompt_template = PromptTemplate.from_template(self.prompt_text)
+        self.model = chat_model
+        self.chain = self._init_chain()
+
+    def _init_chain(self):
+        chain = self.prompt_template | print_prompt | self.model | StrOutputParser()
+        return chain
+
+    def retriever_docs(self, query: str) -> list[Document]:
+        return self.retriever.invoke(query)
+
+    def rag_summarize(self, query: str) -> str:
+
+        context_docs = self.retriever_docs(query)
+
+        context = ""
+        counter = 0
+        for doc in context_docs:
+            counter += 1
+            context += f"【参考资料{counter}】: 参考资料：{doc.page_content} | 参考元数据：{doc.metadata}\n"
+
+        return self.chain.invoke(
+            {
+                "input": query,
+                "context": context,
+            }
+        )
+
+vector_store.py:
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from utils.config_handler import chroma_conf
+
+from model.factory import embed_model
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from utils.path_tool import get_abs_path
+from utils.file_handler import pdf_loader, txt_loader, listdir_with_allowed_type, get_file_md5_hex
+from utils.logger_handler import logger
+
+import os
+
+
+class VectorStoreService:
+    def __init__(self):
+        self.vector_store = Chroma(
+            collection_name=chroma_conf["collection_name"],
+            embedding_function=embed_model,
+            persist_directory=chroma_conf["persist_directory"],
+        )
+
+        self.spliter = RecursiveCharacterTextSplitter(
+            chunk_size=chroma_conf["chunk_size"],
+            chunk_overlap=chroma_conf["chunk_overlap"],
+            separators=chroma_conf["separators"],
+            length_function=len,
+        )
+
+    def get_retriever(self):
+        return self.vector_store.as_retriever(search_kwargs={"k": chroma_conf["k"]})
+
+    def load_document(self):
+        """
+        从数据文件夹内读取数据文件，转为向量存入向量库
+        要计算文件的MD5做去重
+        :return: None
+        """
+
+        def check_md5_hex(md5_for_check: str):
+            if not os.path.exists(get_abs_path(chroma_conf["md5_hex_store"])):
+                # 创建文件
+                open(get_abs_path(chroma_conf["md5_hex_store"]), "w", encoding="utf-8").close()
+                return False            # md5 没处理过
+
+            with open(get_abs_path(chroma_conf["md5_hex_store"]), "r", encoding="utf-8") as f:
+                for line in f.readlines():
+                    line = line.strip()
+                    if line == md5_for_check:
+                        return True     # md5 处理过
+
+                return False            # md5 没处理过
+
+        def save_md5_hex(md5_for_check: str):
+            with open(get_abs_path(chroma_conf["md5_hex_store"]), "a", encoding="utf-8") as f:
+                f.write(md5_for_check + "\n")
+
+        def get_file_documents(read_path: str):
+            if read_path.endswith("txt"):
+                return txt_loader(read_path)
+
+            if read_path.endswith("pdf"):
+                return pdf_loader(read_path)
+
+            return []
+
+        allowed_files_path: list[str] = listdir_with_allowed_type(
+            get_abs_path(chroma_conf["data_path"]),
+            tuple(chroma_conf["allow_knowledge_file_type"]),
+        )
+
+        for path in allowed_files_path:
+            # 获取文件的MD5
+            md5_hex = get_file_md5_hex(path)
+
+            if check_md5_hex(md5_hex):
+                logger.info(f"[加载知识库]{path}内容已经存在知识库内，跳过")
+                continue
+
+            try:
+                documents: list[Document] = get_file_documents(path)
+
+                if not documents:
+                    logger.warning(f"[加载知识库]{path}内没有有效文本内容，跳过")
+                    continue
+
+                split_document: list[Document] = self.spliter.split_documents(documents)
+
+                if not split_document:
+                    logger.warning(f"[加载知识库]{path}分片后没有有效文本内容，跳过")
+                    continue
+
+                # 将内容存入向量库
+                self.vector_store.add_documents(split_document)
+
+                # 记录这个已经处理好的文件的md5，避免下次重复加载
+                save_md5_hex(md5_hex)
+
+                logger.info(f"[加载知识库]{path} 内容加载成功")
+            except Exception as e:
+                # exc_info为True会记录详细的报错堆栈，如果为False仅记录报错信息本身
+                logger.error(f"[加载知识库]{path}加载失败：{str(e)}", exc_info=True)
+                continue
+
+
+if __name__ == '__main__':
+    vs = VectorStoreService()
+
+    vs.load_document()
+
+    retriever = vs.get_retriever()
+
+    res = retriever.invoke("迷路")
+    for r in res:
+        print(r.page_content)
+        print("-"*20)
+
+
+
+config_handler.py：
+"""
+yml
+k : V
+
+"""
+
+
+
+import yaml
+from utils.path_tool import get_abs_path
+
+#加载RAG的配置文件
+def load_rag_config(config_path: str = get_abs_path("config/rag.yml"), encoding: str = "utf-8"):
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+#加载Chroma向量数据库的配置文件
+def load_chroma_config(config_path: str = get_abs_path("config/chroma.yml"), encoding: str = "utf-8"):
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+#加载Prompt提示词的配置文件
+def load_prompts_config(config_path: str = get_abs_path("config/prompts.yml"), encoding: str = "utf-8"):
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+#加载Agent的配置文件
+def load_agent_config(config_path: str = get_abs_path("config/agent.yml"), encoding: str = "utf-8"):
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+def load_mysql_config(config_path: str = get_abs_path("config/mysql.yml"), encoding: str = "utf-8"):
+    with open(config_path, "r", encoding=encoding) as f:
+        return yaml.load(f, Loader=yaml.FullLoader)["mysql"]
+
+rag_conf = load_rag_config()
+chroma_conf = load_chroma_config()
+agent_conf = load_agent_config()
+prompts_conf = load_prompts_config()
+
+
+conversation_db.py:
+# utils/conversation_db.py 完整替换如下
+import os
+import datetime
+import pymysql
+import bcrypt
+from typing import List, Dict, Optional
+from utils.logger_handler import logger
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agent_db")
+
+def get_db_connection():
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False
+    )
+
+def init_db():
+    """初始化表结构（在模块加载时自动执行）"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 用户表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # 会话表增加 user_id
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id VARCHAR(36) PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    conv_id VARCHAR(36) NOT NULL,
+                    role VARCHAR(20) NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (conv_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                    INDEX idx_conv_id (conv_id)
+                )
+            ''')
+        conn.commit()
+        logger.info("MySQL 表初始化成功")
+    except Exception as e:
+        logger.error(f"MySQL 初始化失败: {e}")
+        raise
+    finally:
+        conn.close()
+
+init_db()
+
+# ---------- 用户相关 ----------
+def create_user(username: str, password: str) -> Optional[int]:
+    """创建用户，返回用户ID，失败返回None"""
+    conn = get_db_connection()
+    try:
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+                (username, hashed)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except pymysql.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+def authenticate_user(username: str, password: str) -> Optional[int]:
+    """验证用户，返回user_id，失败返回None"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, password_hash FROM users WHERE username = %s", (username,))
+            user = cursor.fetchone()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+                return user['id']
+            return None
+    finally:
+        conn.close()
+
+# ---------- 会话管理（增加 user_id 参数）----------
+def create_conversation(conv_id: str, user_id: int, title: str = "新对话") -> bool:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
+                (conv_id, user_id, title, datetime.datetime.now(), datetime.datetime.now())
+            )
+        conn.commit()
+        return True
+    except pymysql.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_conversation(conv_id: str, user_id: int) -> Optional[Dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = %s AND user_id = %s",
+                (conv_id, user_id)
+            )
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+def get_all_conversations(user_id: int) -> List[Dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id = %s ORDER BY updated_at DESC",
+                (user_id,)
+            )
+            return cursor.fetchall()
+    finally:
+        conn.close()
+
+def delete_conversation(conv_id: str, user_id: int) -> bool:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            affected = cursor.execute(
+                "DELETE FROM conversations WHERE id = %s AND user_id = %s",
+                (conv_id, user_id)
+            )
+        conn.commit()
+        return affected > 0
+    finally:
+        conn.close()
+
+def update_conversation_title(conv_id: str, user_id: int, title: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE conversations SET title = %s, updated_at = %s WHERE id = %s AND user_id = %s",
+                (title, datetime.datetime.now(), conv_id, user_id)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def add_message(conv_id: str, user_id: int, role: str, content: str):
+    """注意：这里需要确保 conv_id 属于该 user_id，否则应该失败"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 先验证会话属于用户
+            cursor.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s", (conv_id, user_id))
+            if not cursor.fetchone():
+                raise PermissionError("会话不属于当前用户")
+            cursor.execute(
+                "INSERT INTO messages (conv_id, role, content, timestamp) VALUES (%s, %s, %s, %s)",
+                (conv_id, role, content, datetime.datetime.now())
+            )
+            cursor.execute(
+                "UPDATE conversations SET updated_at = %s WHERE id = %s",
+                (datetime.datetime.now(), conv_id)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_messages(conv_id: str, user_id: int) -> List[Dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 验证会话属于用户
+            cursor.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s", (conv_id, user_id))
+            if not cursor.fetchone():
+                return []
+            cursor.execute(
+                "SELECT role, content, timestamp FROM messages WHERE conv_id = %s ORDER BY timestamp ASC",
+                (conv_id,)
+            )
+            return cursor.fetchall()
+    finally:
+        conn.close()
+
+def clear_conversation_messages(conv_id: str, user_id: int):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s", (conv_id, user_id))
+            if cursor.fetchone():
+                cursor.execute("DELETE FROM messages WHERE conv_id = %s", (conv_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+file_handler.py:
+#集成Chroma向量数据库与MD5去重
+
+import os,hashlib
+from utils.logger_handler import logger
+
+from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader,TextLoader
+
+def get_file_md5_hex(filepath:str):         # 获取文件的md5的十六进制字符串
+    if not os.path.exists(filepath):
+        logger.error(f"[MD5计算]文件{filepath}不存在")
+        return
+    if not os.path.isfile(filepath):
+        logger.error(f"[MD5计算]路径{filepath}不是文件")
+        return
+
+    md5_obj = hashlib.md5()
+    chunk_size=4096     # 4KB分片加载，避免文件过大爆内存
+    try:
+            with open(filepath, "rb")as f:  # 必须二进制读取
+                while chunk:=f.read(chunk_size):
+                    md5_obj.update(chunk)
+                """
+                等价于：
+                chunk=f.read(chunk_size)
+                while chunk:
+                    md5_obj.update(chunk)
+                    chunk=f.read(chunk_size)
+                """
+            md5_hex=md5_obj.hexdigest()     #生成md5
+            return md5_hex
+    except Exception as  e:
+        logger.error(f"计算文件{filepath}md5失败，{str(e)}")
+        return None
+
+def listdir_with_allowed_type(path:str,allowed_types:tuple[str]):   # 返回文件夹内的文件列表（允许的文件后缀）
+    files= []
+    if not os.path.isdir(path):
+        logger.error(f"[lisdir_with_allowed_type]{path}不是文件夹")
+        return allowed_types
+
+    for f in os.listdir(path):
+        if f.endswith(allowed_types):   #以允许的文件类型结尾
+            files.append(os.path.join(path,f))
+    return tuple(files)
+
+#加载pdf文档
+def pdf_loader(filepath:str,passwd=None)->list[Document]:
+
+    return PyPDFLoader(filepath,passwd).load()
+
+#加载文本文档
+def txt_loader(filepath:str)->list[Document]:
+
+    return TextLoader(filepath,encoding="utf-8").load()
+
+logger_handler.py：
+import logging
+from utils.path_tool import get_abs_path
+
+import os
+from datetime import time, datetime
+
+# 日志保存的根目录
+LOG_ROOT=get_abs_path("logs")
+
+# 确保日志的目录所在
+os.makedirs(LOG_ROOT,exist_ok=True)
+
+# 日志的格式配置   日志级别：error info debug
+DEFAULT_LOG_FORMAT= logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
+)
+
+def get_logger(
+        name: str= "agent",
+        console_level:int =logging.INFO,        # 只输出info级别以上的日志信息，避免debug垃圾信息
+        file_level: int=logging.DEBUG,      #debug级别：即啰嗦模式
+        log_file =None,
+) -> logging.Logger:    #logging是库
+    logger =logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    # 避免重复添加Handler,如果存在,不重复打印日志
+    if logger.handlers:
+        return logger
+    # 控制台Handler（处理器）
+    console_handler= logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(DEFAULT_LOG_FORMAT)    #设置格式
+
+    logger.addHandler(console_handler)  #配置控制台处理器
+
+    # 文件Handler（处理器）
+    if not log_file:            # 日志文件的存放路径
+        log_file= os.path.join(LOG_ROOT,f"{name}_{datetime.now().strftime('%Y%m%d')}.log")
+
+    file_handler=logging.FileHandler(log_file,encoding='utf-8')
+    file_handler.setLevel(file_level)
+    file_handler.setFormatter(DEFAULT_LOG_FORMAT)
+
+    logger.addHandler(file_handler)     #配置文件处理器
+
+    return logger
+
+# 快捷获取日志器
+logger=get_logger()
+
+if __name__== '__main__':
+    logger.info("信息日志")
+    logger.error("错误日志")
+    logger.warning("警告日志")
+    logger.debug("调试日志")
+
+
+path_tool.py：
+"""
+为整个工程提供统一的绝对路径
+"""
+import os
+
+def get_project_root() -> str:
+    """
+    获取工程所在的根目录
+    :return: 字符串根目录
+    """
+    # 当前文件的绝对路径
+    current_file= os.path.abspath(__file__)
+    # 获取工程的根目录，先获取文件所在的文件夹的绝对路径    通俗来说就是向上跳一级
+    current_dir=os.path.dirname(current_file)
+    # 获取工程根目录    再向上跳一级
+    project_root=os.path.dirname(current_dir)
+
+    return project_root
+
+def get_abs_path(relative_path:str)->str:
+    """
+    传递相对路径，得到绝对路径
+    :param relative_path: 相对路径
+    :return: 绝对路径
+    """
+    project_root=get_project_root()
+    return os.path.join(project_root,relative_path)
+
+if __name__ == '__main__':
+    print(get_abs_path("config/config.txt"))
+
+
+
+prompt_loader.py：
+from utils.config_handler import prompts_conf
+from utils.path_tool import get_abs_path
+from utils.logger_handler import logger
+
+#系统提示词
+def load_system_prompts():
+    try:
+        system_prompt_path = get_abs_path(prompts_conf["main_prompt_path"])
+    except KeyError as e:
+        logger.error(f"[load_system_prompts]在yaml配置项中没有main_prompt_path配置项")
+        raise e
+
+    try:
+        return open(system_prompt_path,"r",encoding="utf-8").read()
+    except Exception as e:
+        logger.error(f"[load_system_prompts]解析系统提示词出错，{str(e)}")
+        raise e
+
+#RAG提示词
+def load_rag_prompts():
+    try:
+        rag_prompt_path = get_abs_path(prompts_conf["rag_summarize_prompt_path"])
+    except KeyError as e:
+        logger.error(f"[load_rag_prompts]在yaml配置项中没有rag_summarize_prompt_path配置项")
+        raise e
+
+    try:
+        return open(rag_prompt_path, "r", encoding="utf-8").read()
+    except Exception as e:
+        logger.error(f"[load_rag_prompts]解析RAG提示词出错，{str(e)}")
+        raise e
+
+#报告提示词
+def load_report_prompts():
+    try:
+        report_prompt_path = get_abs_path(prompts_conf["report_prompt_path"])
+    except KeyError as e:
+        logger.error(f"[load_report_prompts]在yaml配置项中没有report_prompt_path配置项")
+        raise e
+
+    try:
+        return open(report_prompt_path, "r", encoding="utf-8").read()
+    except Exception as e:
+        logger.error(f"[load_report_prompts]解析报告生成提示词出错，{str(e)}")
+        raise e
+
+if __name__=='__main__':
+    print(load_report_prompts())
+
+    
+
+app.py：
+# app.py (多用户版本，修复登录/注册分离和自动创建对话)
+import streamlit as st
+import uuid
+from agent.react_agent import ReactAgent
+from utils.conversation_db import (
+    create_conversation, get_all_conversations, delete_conversation,
+    get_messages, update_conversation_title, get_conversation,
+    authenticate_user, create_user
+)
+
+st.set_page_config(page_title="脑信号解码智能助手", layout="wide")
+
+# 初始化 session_state
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user_id = None
+    st.session_state.username = None
+if "show_register" not in st.session_state:
+    st.session_state.show_register = False   # False=登录界面, True=注册界面
+
+def auto_login(username, password):
+    """注册成功后自动登录"""
+    user_id = authenticate_user(username, password)
+    if user_id:
+        st.session_state.authenticated = True
+        st.session_state.user_id = user_id
+        st.session_state.username = username
+        # 为新用户创建一个会话（如果还没有）
+        convs = get_all_conversations(user_id)
+        if not convs:
+            new_id = str(uuid.uuid4())
+            create_conversation(new_id, user_id, "新对话")
+            st.session_state.current_conv_id = new_id
+        else:
+            st.session_state.current_conv_id = convs[0]["id"]
+        st.rerun()
+    else:
+        st.error("自动登录失败，请手动登录")
+
+def show_login():
+    st.title("🔐 用户登录 / 注册")
+    
+    if not st.session_state.show_register:
+        # ---------- 登录表单 ----------
+        with st.form("login_form"):
+            login_username = st.text_input("用户名")
+            login_password = st.text_input("密码", type="password")
+            login_submit = st.form_submit_button("登录")
+            if login_submit:
+                if not login_username or not login_password:
+                    st.error("请填写用户名和密码")
+                else:
+                    user_id = authenticate_user(login_username, login_password)
+                    if user_id:
+                        st.session_state.authenticated = True
+                        st.session_state.user_id = user_id
+                        st.session_state.username = login_username
+                        # 检查是否有会话，没有则创建
+                        convs = get_all_conversations(user_id)
+                        if convs:
+                            st.session_state.current_conv_id = convs[0]["id"]
+                        else:
+                            new_id = str(uuid.uuid4())
+                            create_conversation(new_id, user_id, "新对话")
+                            st.session_state.current_conv_id = new_id
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误")
+        
+        # 切换到注册界面的按钮
+        if st.button("还没有账号？立即注册"):
+            st.session_state.show_register = True
+            st.rerun()
+    
+    else:
+        # ---------- 注册表单 ----------
+        with st.form("register_form"):
+            reg_username = st.text_input("用户名")
+            reg_password = st.text_input("密码", type="password")
+            reg_confirm = st.text_input("确认密码", type="password")
+            register_submit = st.form_submit_button("注册")
+            if register_submit:
+                if not reg_username or not reg_password:
+                    st.error("用户名和密码不能为空")
+                elif reg_password != reg_confirm:
+                    st.error("两次输入的密码不一致")
+                else:
+                    user_id = create_user(reg_username, reg_password)
+                    if user_id:
+                        st.success("注册成功！正在自动登录...")
+                        # 自动登录
+                        auto_login(reg_username, reg_password)
+                    else:
+                        st.error("用户名已存在")
+        
+        # 返回登录界面的按钮
+        if st.button("← 返回登录"):
+            st.session_state.show_register = False
+            st.rerun()
+
+def show_logout():
+    with st.sidebar:
+        st.write(f"👤 当前用户: {st.session_state.username}")
+        if st.button("🚪 退出登录"):
+            for key in ["authenticated", "user_id", "username", "current_conv_id"]:
+                st.session_state[key] = None
+            st.rerun()
+
+# ------------------ 主应用 ------------------
+if not st.session_state.authenticated:
+    show_login()
+else:
+    show_logout()
+    st.title("🧠 脑信号解码智能助手")
+
+    # 初始化 Agent（全局单例）
+    if "agent" not in st.session_state:
+        st.session_state.agent = ReactAgent()
+
+    # 确保 current_conv_id 存在（登录时已创建，但防御）
+    if "current_conv_id" not in st.session_state:
+        convs = get_all_conversations(st.session_state.user_id)
+        if convs:
+            st.session_state.current_conv_id = convs[0]["id"]
+        else:
+            new_id = str(uuid.uuid4())
+            create_conversation(new_id, st.session_state.user_id, "新对话")
+            st.session_state.current_conv_id = new_id
+
+    # 侧边栏：会话管理
+    with st.sidebar:
+        st.subheader("📋 对话历史")
+        if st.button("➕ 新建对话", use_container_width=True):
+            new_id = str(uuid.uuid4())
+            create_conversation(new_id, st.session_state.user_id, "新对话")
+            st.session_state.current_conv_id = new_id
+            st.rerun()
+
+        st.divider()
+        convs = get_all_conversations(st.session_state.user_id)
+        if not convs:
+            st.info("暂无对话记录")
+        else:
+            for conv in convs:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    title = conv["title"]
+                    if len(title) > 20:
+                        title = title[:20] + "..."
+                    if conv["id"] == st.session_state.current_conv_id:
+                        button_label = f"✅ **{title}**"
+                    else:
+                        button_label = title
+                    if st.button(button_label, key=conv["id"], use_container_width=True):
+                        st.session_state.current_conv_id = conv["id"]
+                        st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"del_{conv['id']}"):
+                        delete_conversation(conv["id"], st.session_state.user_id)
+                        if conv["id"] == st.session_state.current_conv_id:
+                            remaining = get_all_conversations(st.session_state.user_id)
+                            if remaining:
+                                st.session_state.current_conv_id = remaining[0]["id"]
+                            else:
+                                new_id = str(uuid.uuid4())
+                                create_conversation(new_id, st.session_state.user_id, "新对话")
+                                st.session_state.current_conv_id = new_id
+                        st.rerun()
+            st.divider()
+
+        if st.button("🗑️ 清空当前对话", use_container_width=True):
+            from utils.conversation_db import clear_conversation_messages
+            clear_conversation_messages(st.session_state.current_conv_id, st.session_state.user_id)
+            st.rerun()
+
+        st.divider()
+        if st.button("🔧 查看所有工具", use_container_width=True):
+            from agent.tools.tool_registry import tool_registry
+            all_tools = tool_registry.get_all_tools()
+            if all_tools:
+                st.success(f"📦 当前共加载 {len(all_tools)} 个工具")
+                with st.expander("点击展开工具列表", expanded=True):
+                    for tool in all_tools:
+                        st.markdown(f"**{tool.name}**")
+                        st.caption(tool.description or "无描述")
+                        st.divider()
+            else:
+                st.info("暂无可用工具")
+
+    # 主区域：显示消息
+    conv_id = st.session_state.current_conv_id
+    messages = get_messages(conv_id, st.session_state.user_id)
+    for msg in messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    # 自动更新会话标题
+    if messages:
+        first_user_msg = next((m for m in messages if m["role"] == "user"), None)
+        if first_user_msg:
+            conv_info = get_conversation(conv_id, st.session_state.user_id)
+            if conv_info and conv_info["title"] == "新对话":
+                new_title = first_user_msg["content"][:20] + ("..." if len(first_user_msg["content"]) > 20 else "")
+                update_conversation_title(conv_id, st.session_state.user_id, new_title)
+                st.rerun()
+
+    # 输入框
+    prompt = st.chat_input("请输入您的问题...")
+    if prompt:
+        st.chat_message("user").write(prompt)
+        response_placeholder = st.chat_message("assistant").empty()
+        full_response = ""
+        try:
+            for chunk in st.session_state.agent.execute_stream(prompt, conv_id, st.session_state.user_id):
+                full_response += chunk
+                response_placeholder.markdown(full_response + "▌")
+            response_placeholder.markdown(full_response)
+        except Exception as e:
+            response_placeholder.error(f"发生错误: {e}")
+        st.rerun()
+
+.env:
+OPENAI_API_KEY = "sk-2a2325d457924c6d83bfb70e2f2a2f9d"
+DASHSCOPE_API_KEY = "sk-2a2325d457924c6d83bfb70e2f2a2f9d"
+AMAP_WEBSERVICE_KEY="1c43ee492e0ee5a2e16cc099d8f50e25"
+
+# MySQL 配置
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=your_username
+MYSQL_PASSWORD=your_password
+MYSQL_DATABASE=agent_db
+
+
+0.集成工具管理：MCP和Skills工具管理
+1.分布式与微服务架构：熟悉微服务架构下Agent系统设计，熟练运用SpringBoot/SpringCloud实现Agent服务化，具备服务注册发现、网关路由、熔断限流经验。
+2.数据存储与检索：熟练使用MySQL、PostgreSQL存储Agent会话与元数据，掌握向量数据库用于知识库检索，具备高并发下数据读写优化经验。
+3.缓存与中间件：精通Redis用于Agent会话缓存、状态共享与限流，熟悉RabbitMQ/RocketMQ实现异步任务调度与事件通知，具备中间件问题排查能力。
+4.安全与可靠性：了解Agent安全风险（如PromptInjection、工具滥用），掌握输入校验、权限控制、审计日志等防护手段，具备高可用系统设计与故障排查经验
+5.工程化与部署：熟悉Docker/K8s容器化部署，掌握Cl/CD流程实现Agent服务自动化发布，具备日志监控、链路追踪（如SkyWalking、Prometheus）与性能调优能力。
+
+最终目的：别人也可以用我的智能助手，而不是只能在我的本地运行
+
+
+
+1.启动 Streamlit 应用（保持运行）
+streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+2. 另开一个终端窗口，启动 ngrok 隧道
+~/bin/ngrok http 8501
+3. 获取公网地址
+ngrok 启动后会显示一行：
+Forwarding  https://xxxxxxxx.ngrok-free.dev -> http://localhost:8501
+
+https://poser-detached-napped.ngrok-free.dev

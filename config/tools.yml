@@ -1,0 +1,10 @@
+external_tools:
+  - name: "计算器服务"
+    endpoint: "https://mcp.api-inference.modelscope.net/fe9ae1a3001a4f/mcp"
+    type: "mcp"
+  - name: "时间服务"
+    endpoint: "https://mcp.api-inference.modelscope.net/6cd4a33895fc4d/mcp"
+    type: "mcp"
+  - name: "天气服务"  
+    endpoint: "https://mcp.api-inference.modelscope.net/3eef1f267a4c4c/mcp"
+    type: "mcp"
