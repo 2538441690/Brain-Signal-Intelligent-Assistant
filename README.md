@@ -50,6 +50,8 @@ streamlit run app.py
     如果想直接使用，请登录账号：
     账号：wangzhixun
     密码：2538441690
+    <img width="1787" height="493" alt="PixPin_2026-06-01_20-17-07" src="https://github.com/user-attachments/assets/c387bff8-5649-4508-9e0f-f9fddd44f5e5" />
+
 
 (3) 登录后即可进行对话，支持以下自然语言请求：
     日常对话；
@@ -58,6 +60,8 @@ streamlit run app.py
     兴趣点搜索、路径规划；
     数学计算；
     日期、天气查询。  
+    <img width="1856" height="826" alt="PixPin_2026-06-01_20-17-30" src="https://github.com/user-attachments/assets/f4868a7c-3f99-4393-93ee-2b501121d434" />
+
     
 (4) 左侧侧边栏可管理多个会话（新建、删除、切换）。  
 
